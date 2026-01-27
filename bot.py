@@ -294,13 +294,13 @@ async def bookclub(interaction: discord.Interaction, expected_participants: int 
         await interaction.followup.send(
             f"📢 {interaction.user.mention} started a book club session! "
             f"Waiting for **{expected_participants}** participants to recommend or pass.",
-            ephemeral=False
+            ephemeral=True
         )
     else:
         await interaction.followup.send(
             f"📢 {interaction.user.mention} started a book club session! "
             f"Click 'Close & Pick Winner' when everyone has finished recommending.",
-            ephemeral=False
+            ephemeral=True
         )
 
 # Run the bot
