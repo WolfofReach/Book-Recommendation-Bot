@@ -16,19 +16,22 @@ class BookSession:
         self.starter_id = starter_id
         self.expected_users = expected_users
         self.recommendations = {}  # {user_id: [book1, book2]}
+        self.user_names = {}  # {user_id: display_name}
         self.passed_users = set()
         self.is_closed = False
     
-    def add_recommendation(self, user_id, book_title):
+    def add_recommendation(self, user_id, book_title, user_name):
         if user_id not in self.recommendations:
             self.recommendations[user_id] = []
         self.recommendations[user_id].append(book_title)
+        self.user_names[user_id] = user_name
     
     def user_book_count(self, user_id):
         return len(self.recommendations.get(user_id, []))
     
-    def add_pass(self, user_id):
+    def add_pass(self, user_id, user_name):
         self.passed_users.add(user_id)
+        self.user_names[user_id] = user_name
     
     def has_passed(self, user_id):
         return user_id in self.passed_users
@@ -49,12 +52,19 @@ class BookSession:
 
 class RecommendButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="📚 Recommend a Book", style=discord.ButtonStyle.primary)
+        super().__init__(label="📚 Recommend a Book", style=discord.ButtonStyle.primary, custom_id="bookclub:recommend")
     
     async def callback(self, interaction: discord.Interaction):
         session = active_sessions.get(interaction.guild_id)
         
-        if not session or session.is_closed:
+        if not session:
+            await interaction.response.send_message(
+                "⚠️ This session is no longer active (bot may have restarted). Please start a new session with `/bookclub`",
+                ephemeral=True
+            )
+            return
+        
+        if session.is_closed:
             await interaction.response.send_message("This session is closed!", ephemeral=True)
             return
         
@@ -71,12 +81,19 @@ class RecommendButton(discord.ui.Button):
 
 class PassButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="⏭️ Pass", style=discord.ButtonStyle.secondary)
+        super().__init__(label="⏭️ Pass", style=discord.ButtonStyle.secondary, custom_id="bookclub:pass")
     
     async def callback(self, interaction: discord.Interaction):
         session = active_sessions.get(interaction.guild_id)
         
-        if not session or session.is_closed:
+        if not session:
+            await interaction.response.send_message(
+                "⚠️ This session is no longer active (bot may have restarted). Please start a new session with `/bookclub`",
+                ephemeral=True
+            )
+            return
+        
+        if session.is_closed:
             await interaction.response.send_message("This session is closed!", ephemeral=True)
             return
         
@@ -88,7 +105,7 @@ class PassButton(discord.ui.Button):
             await interaction.response.send_message("You've already passed!", ephemeral=True)
             return
         
-        session.add_pass(interaction.user.id)
+        session.add_pass(interaction.user.id, interaction.user.display_name)
         await interaction.response.send_message(f"✅ {interaction.user.mention} has passed on recommending.", ephemeral=False)
         
         # Update the embed
@@ -100,13 +117,16 @@ class PassButton(discord.ui.Button):
 
 class CloseButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="🎲 Close & Pick Winner", style=discord.ButtonStyle.success)
+        super().__init__(label="🎲 Close & Pick Winner", style=discord.ButtonStyle.success, custom_id="bookclub:close")
     
     async def callback(self, interaction: discord.Interaction):
         session = active_sessions.get(interaction.guild_id)
         
         if not session:
-            await interaction.response.send_message("No active session!", ephemeral=True)
+            await interaction.response.send_message(
+                "⚠️ This session is no longer active (bot may have restarted). Please start a new session with `/bookclub`",
+                ephemeral=True
+            )
             return
         
         if interaction.user.id != session.starter_id:
@@ -133,7 +153,7 @@ class BookModal(discord.ui.Modal, title="Recommend a Book"):
     
     async def on_submit(self, interaction: discord.Interaction):
         book = self.book_title.value.strip()
-        self.session.add_recommendation(interaction.user.id, book)
+        self.session.add_recommendation(interaction.user.id, book, interaction.user.display_name)
         
         count = self.session.user_book_count(interaction.user.id)
         await interaction.response.send_message(
@@ -200,8 +220,7 @@ async def close_and_pick_winner(interaction: discord.Interaction, session):
     # List all recommendations
     rec_text = ""
     for user_id, books in session.recommendations.items():
-        user = interaction.guild.get_member(user_id)
-        user_name = user.mention if user else f"User {user_id}"
+        user_name = session.user_names.get(user_id, f"User {user_id}")
         for book in books:
             rec_text += f"• {book} (by {user_name})\n"
     
@@ -231,19 +250,17 @@ def create_session_embed(session, guild):
     if session.recommendations:
         rec_text = ""
         for user_id, books in session.recommendations.items():
-            user = guild.get_member(user_id)
-            user_name = user.display_name if user else f"User {user_id}"
+            user_name = session.user_names.get(user_id, f"User {user_id}")
             rec_text += f"**{user_name}** ({len(books)}/2):\n"
             for book in books:
-                rec_text += f"  • {book}\n"
+                rec_text += f"• {book}\n"
         embed.add_field(name="Current Recommendations", value=rec_text, inline=False)
     
     # Show passed users
     if session.passed_users:
         passed_text = ""
         for user_id in session.passed_users:
-            user = guild.get_member(user_id)
-            user_name = user.mention if user else f"User {user_id}"
+            user_name = session.user_names.get(user_id, f"User {user_id}")
             passed_text += f"{user_name}\n"
         embed.add_field(name="Passed", value=passed_text, inline=False)
     
@@ -262,6 +279,10 @@ def create_session_embed(session, guild):
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
+    
+    # Register persistent view so buttons work after restarts
+    bot.add_view(BookClubView())
+    
     try:
         synced = await bot.tree.sync()
         print(f'Synced {len(synced)} command(s)')
