@@ -3,6 +3,10 @@ from discord.ext import commands
 from discord import app_commands
 import random
 import os
+import aiohttp
+import asyncio
+from urllib.parse import quote_plus
+import re
 
 # Bot setup
 intents = discord.Intents.default()
@@ -10,6 +14,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Store active sessions per guild
 active_sessions = {}
+checkin_sessions = {}  # Store active checkin sessions per guild
 
 class BookSession:
     def __init__(self, starter_id, expected_users=None):
@@ -49,6 +54,42 @@ class BookSession:
         if self.expected_users is not None:
             return self.get_participant_count() >= self.expected_users
         return False
+
+class CheckinSession:
+    def __init__(self, book_title, description, cover_url, expected_readers):
+        self.book_title = book_title
+        self.description = description
+        self.cover_url = cover_url
+        self.expected_readers = expected_readers
+        self.readers_50 = {}  # {user_id: display_name}
+        self.readers_100 = {}  # {user_id: display_name}
+        self.pinged_50 = False
+        self.pinged_100 = False
+    
+    def checkin_50(self, user_id, user_name):
+        """Check in at 50% progress"""
+        self.readers_50[user_id] = user_name
+    
+    def checkin_100(self, user_id, user_name):
+        """Check in at 100% progress"""
+        # Also add to 50% if not already there
+        if user_id not in self.readers_50:
+            self.readers_50[user_id] = user_name
+        self.readers_100[user_id] = user_name
+    
+    def has_checked_50(self, user_id):
+        return user_id in self.readers_50
+    
+    def has_checked_100(self, user_id):
+        return user_id in self.readers_100
+    
+    def should_ping_50(self):
+        """Check if we should ping for 50% milestone"""
+        return len(self.readers_50) >= self.expected_readers and not self.pinged_50
+    
+    def should_ping_100(self):
+        """Check if we should ping for 100% milestone"""
+        return len(self.readers_100) >= self.expected_readers and not self.pinged_100
 
 class RecommendButton(discord.ui.Button):
     def __init__(self):
@@ -168,6 +209,70 @@ class BookModal(discord.ui.Modal, title="Recommend a Book"):
         if self.session.is_complete() and not self.session.is_closed:
             await auto_close_session(interaction)
 
+class Checkin50Button(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="📖 50% Progress", style=discord.ButtonStyle.primary, custom_id="checkin:50")
+    
+    async def callback(self, interaction: discord.Interaction):
+        session = checkin_sessions.get(interaction.guild_id)
+        
+        if not session:
+            await interaction.response.send_message(
+                "⚠️ This checkin session is no longer active.",
+                ephemeral=True
+            )
+            return
+        
+        if session.has_checked_50(interaction.user.id):
+            await interaction.response.send_message("You've already checked in at 50%!", ephemeral=True)
+            return
+        
+        session.checkin_50(interaction.user.id, interaction.user.display_name)
+        await interaction.response.send_message(f"✅ {interaction.user.mention} is 50% through the book!", ephemeral=False)
+        
+        # Update the embed
+        await update_checkin_message(interaction)
+        
+        # Check if we should ping for 50% milestone
+        if session.should_ping_50():
+            session.pinged_50 = True
+            await interaction.channel.send(f"🎉 @everyone - {session.expected_readers} readers have reached 50% progress!")
+
+class Checkin100Button(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="✅ Finished (100%)", style=discord.ButtonStyle.success, custom_id="checkin:100")
+    
+    async def callback(self, interaction: discord.Interaction):
+        session = checkin_sessions.get(interaction.guild_id)
+        
+        if not session:
+            await interaction.response.send_message(
+                "⚠️ This checkin session is no longer active.",
+                ephemeral=True
+            )
+            return
+        
+        if session.has_checked_100(interaction.user.id):
+            await interaction.response.send_message("You've already checked in at 100%!", ephemeral=True)
+            return
+        
+        session.checkin_100(interaction.user.id, interaction.user.display_name)
+        await interaction.response.send_message(f"✅ {interaction.user.mention} has finished the book! 🎊", ephemeral=False)
+        
+        # Update the embed
+        await update_checkin_message(interaction)
+        
+        # Check if we should ping for 100% milestone
+        if session.should_ping_100():
+            session.pinged_100 = True
+            await interaction.channel.send(f"🎉 @everyone - {session.expected_readers} readers have finished the book!")
+
+class CheckinView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(Checkin50Button())
+        self.add_item(Checkin100Button())
+
 class BookClubView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -189,6 +294,20 @@ async def update_session_message(interaction: discord.Interaction):
     except:
         pass
 
+async def update_checkin_message(interaction: discord.Interaction):
+    """Update the checkin embed with current progress"""
+    session = checkin_sessions.get(interaction.guild_id)
+    if not session:
+        return
+    
+    embed = create_checkin_embed(session)
+    
+    try:
+        # Edit the original message
+        await interaction.message.edit(embed=embed)
+    except:
+        pass
+
 async def auto_close_session(interaction: discord.Interaction):
     """Automatically close session if expected users reached"""
     session = active_sessions.get(interaction.guild_id)
@@ -196,15 +315,18 @@ async def auto_close_session(interaction: discord.Interaction):
         return
     
     await interaction.channel.send(f"🎉 Expected number of participants reached! Closing session and picking winner...")
-    await close_and_pick_winner(interaction, session)
+    await close_and_pick_winner(interaction, session, auto_close=True)
 
-async def close_and_pick_winner(interaction: discord.Interaction, session):
+async def close_and_pick_winner(interaction: discord.Interaction, session, auto_close=False):
     """Close the session and randomly pick a book"""
     session.is_closed = True
     all_books = session.get_all_books()
     
     if not all_books:
-        await interaction.response.send_message("❌ No books were recommended! Session closed with no winner.", ephemeral=False)
+        if auto_close:
+            await interaction.channel.send("❌ No books were recommended! Session closed with no winner.")
+        else:
+            await interaction.response.send_message("❌ No books were recommended! Session closed with no winner.", ephemeral=False)
         del active_sessions[interaction.guild_id]
         return
     
@@ -233,7 +355,11 @@ async def close_and_pick_winner(interaction: discord.Interaction, session):
         inline=False
     )
     
-    await interaction.response.send_message(embed=embed)
+    # Send message based on how the function was called
+    if auto_close:
+        await interaction.channel.send(embed=embed)
+    else:
+        await interaction.response.send_message(embed=embed)
     
     # Clear the session
     del active_sessions[interaction.guild_id]
@@ -276,12 +402,59 @@ def create_session_embed(session, guild):
     
     return embed
 
+def create_checkin_embed(session):
+    """Create an embed showing current checkin status"""
+    embed = discord.Embed(
+        title=f"📚 {session.book_title}",
+        description=session.description,
+        color=discord.Color.blue()
+    )
+    
+    # Set book cover as thumbnail
+    if session.cover_url:
+        embed.set_thumbnail(url=session.cover_url)
+    
+    # Show 50% progress
+    if session.readers_50:
+        readers_50_text = "\n".join([f"• {name}" for name in session.readers_50.values()])
+        embed.add_field(
+            name=f"📖 50% Progress ({len(session.readers_50)}/{session.expected_readers})",
+            value=readers_50_text,
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name=f"📖 50% Progress (0/{session.expected_readers})",
+            value="No one has checked in yet",
+            inline=False
+        )
+    
+    # Show 100% progress
+    if session.readers_100:
+        readers_100_text = "\n".join([f"• {name}" for name in session.readers_100.values()])
+        embed.add_field(
+            name=f"✅ Finished - 100% ({len(session.readers_100)}/{session.expected_readers})",
+            value=readers_100_text,
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name=f"✅ Finished - 100% (0/{session.expected_readers})",
+            value="No one has finished yet",
+            inline=False
+        )
+    
+    embed.set_footer(text="Click the buttons below to check in your reading progress!")
+    
+    return embed
+
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     
-    # Register persistent view so buttons work after restarts
+    # Register persistent views so buttons work after restarts
     bot.add_view(BookClubView())
+    bot.add_view(CheckinView())
     
     try:
         synced = await bot.tree.sync()
@@ -323,6 +496,254 @@ async def bookclub(interaction: discord.Interaction, expected_participants: int 
             f"Click 'Close & Pick Winner' when everyone has finished recommending.",
             ephemeral=True
         )
+
+# ===== BOOK PRICE LOOKUP FUNCTIONS =====
+
+async def get_book_info_from_google(book_title):
+    """Get book info from Google Books API"""
+    try:
+        url = f"https://www.googleapis.com/books/v1/volumes?q={quote_plus(book_title)}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('items'):
+                        book = data['items'][0]['volumeInfo']
+                        isbn_13 = None
+                        isbn_10 = None
+                        
+                        # Get ISBNs
+                        for identifier in book.get('industryIdentifiers', []):
+                            if identifier['type'] == 'ISBN_13':
+                                isbn_13 = identifier['identifier']
+                            elif identifier['type'] == 'ISBN_10':
+                                isbn_10 = identifier['identifier']
+                        
+                        return {
+                            'title': book.get('title', book_title),
+                            'authors': book.get('authors', []),
+                            'isbn_13': isbn_13,
+                            'isbn_10': isbn_10,
+                            'thumbnail': book.get('imageLinks', {}).get('thumbnail')
+                        }
+    except Exception as e:
+        print(f"Error fetching from Google Books: {e}")
+    return None
+
+async def scrape_amazon_price(book_title):
+    """Attempt to scrape Amazon price"""
+    try:
+        search_url = f"https://www.amazon.com/s?k={quote_plus(book_title)}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    # Look for price patterns
+                    price_match = re.search(r'\$(\d+\.\d{2})', html)
+                    if price_match:
+                        return float(price_match.group(1))
+    except Exception as e:
+        print(f"Error scraping Amazon: {e}")
+    return None
+
+async def scrape_bookshop_price(book_title):
+    """Attempt to scrape Bookshop.org price"""
+    try:
+        search_url = f"https://bookshop.org/search?keywords={quote_plus(book_title)}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    price_match = re.search(r'\$(\d+\.\d{2})', html)
+                    if price_match:
+                        return float(price_match.group(1))
+    except Exception as e:
+        print(f"Error scraping Bookshop: {e}")
+    return None
+
+async def get_retailer_links(book_title, isbn_13=None):
+    """Generate retailer search links and attempt to get prices"""
+    retailers = []
+    
+    # Amazon
+    amazon_url = f"https://www.amazon.com/s?k={quote_plus(book_title)}"
+    amazon_price = await scrape_amazon_price(book_title)
+    retailers.append({
+        'name': 'Amazon',
+        'url': amazon_url,
+        'price': amazon_price
+    })
+    
+    # Bookshop.org (supports indie bookstores)
+    bookshop_url = f"https://bookshop.org/search?keywords={quote_plus(book_title)}"
+    bookshop_price = await scrape_bookshop_price(book_title)
+    retailers.append({
+        'name': 'Bookshop.org',
+        'url': bookshop_url,
+        'price': bookshop_price
+    })
+    
+    # Barnes & Noble
+    bn_url = f"https://www.barnesandnoble.com/s/{quote_plus(book_title)}"
+    retailers.append({
+        'name': 'Barnes & Noble',
+        'url': bn_url,
+        'price': None
+    })
+    
+    # ThriftBooks (used books)
+    thrift_url = f"https://www.thriftbooks.com/browse/?b.search={quote_plus(book_title)}"
+    retailers.append({
+        'name': 'ThriftBooks',
+        'url': thrift_url,
+        'price': None
+    })
+    
+    # AbeBooks (used/rare books)
+    abe_url = f"https://www.abebooks.com/servlet/SearchResults?kn={quote_plus(book_title)}"
+    retailers.append({
+        'name': 'AbeBooks',
+        'url': abe_url,
+        'price': None
+    })
+    
+    # Book Depository (free worldwide shipping)
+    bookdep_url = f"https://www.bookdepository.com/search?searchTerm={quote_plus(book_title)}"
+    retailers.append({
+        'name': 'Book Depository',
+        'url': bookdep_url,
+        'price': None
+    })
+    
+    return retailers
+
+def create_price_embed(book_info, retailers):
+    """Create an embed showing book prices and retailer links"""
+    title = book_info['title'] if book_info else "Book Price Lookup"
+    
+    embed = discord.Embed(
+        title=f"💰 {title}",
+        description="Here are links to find the best price:",
+        color=discord.Color.green()
+    )
+    
+    if book_info:
+        if book_info.get('authors'):
+            embed.add_field(
+                name="Author(s)",
+                value=", ".join(book_info['authors']),
+                inline=False
+            )
+        
+        if book_info.get('thumbnail'):
+            embed.set_thumbnail(url=book_info['thumbnail'])
+    
+    # Sort retailers by price (prices first, then non-priced)
+    priced_retailers = [r for r in retailers if r['price'] is not None]
+    unpriced_retailers = [r for r in retailers if r['price'] is None]
+    
+    priced_retailers.sort(key=lambda x: x['price'])
+    sorted_retailers = priced_retailers + unpriced_retailers
+    
+    # Show top 3 with prices if available
+    retailer_text = ""
+    for i, retailer in enumerate(sorted_retailers[:6], 1):
+        price_str = f"**${retailer['price']:.2f}**" if retailer['price'] else "Price not available"
+        retailer_text += f"{i}. [{retailer['name']}]({retailer['url']}) - {price_str}\n"
+    
+    embed.add_field(
+        name="🔗 Check Prices",
+        value=retailer_text,
+        inline=False
+    )
+    
+    if priced_retailers:
+        embed.add_field(
+            name="💡 Tip",
+            value=f"Lowest found price: **${priced_retailers[0]['price']:.2f}** at {priced_retailers[0]['name']}",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="💡 Note",
+            value="Couldn't fetch live prices. Click the links above to check current prices at each retailer.",
+            inline=False
+        )
+    
+    embed.set_footer(text="Prices are approximate and may vary. Click links to see current prices.")
+    
+    return embed
+
+@bot.tree.command(name="bookprice", description="Find the best prices for a book across multiple retailers")
+@app_commands.describe(book_title="Title of the book to search for")
+async def bookprice(interaction: discord.Interaction, book_title: str):
+    await interaction.response.defer()  # This might take a moment
+    
+    # Get book info from Google Books
+    book_info = await get_book_info_from_google(book_title)
+    
+    # Get retailer links and attempt price scraping
+    retailers = await get_retailer_links(
+        book_title,
+        book_info['isbn_13'] if book_info else None
+    )
+    
+    # Create and send embed
+    embed = create_price_embed(book_info, retailers)
+    await interaction.followup.send(embed=embed)
+
+# ===== END BOOK PRICE LOOKUP FUNCTIONS =====
+
+
+@bot.tree.command(name="checkin", description="Create a reading progress checkin for the current book")
+@app_commands.describe(
+    book_title="Title of the current book",
+    description="Brief description of the book",
+    cover_url="URL to the book cover image",
+    expected_readers="Number of expected readers"
+)
+async def checkin(
+    interaction: discord.Interaction,
+    book_title: str,
+    description: str,
+    cover_url: str,
+    expected_readers: int
+):
+    if interaction.guild_id in checkin_sessions:
+        await interaction.response.send_message(
+            "❌ There's already an active checkin session in this server! "
+            "Only one checkin can be active at a time.",
+            ephemeral=True
+        )
+        return
+    
+    if expected_readers < 1:
+        await interaction.response.send_message("❌ Expected readers must be at least 1!", ephemeral=True)
+        return
+    
+    # Create new checkin session
+    session = CheckinSession(book_title, description, cover_url, expected_readers)
+    checkin_sessions[interaction.guild_id] = session
+    
+    # Create embed
+    embed = create_checkin_embed(session)
+    
+    # Send message with buttons
+    view = CheckinView()
+    await interaction.response.send_message(embed=embed, view=view)
+    
+    await interaction.followup.send(
+        f"📢 {interaction.user.mention} started a reading progress checkin for **{book_title}**!",
+        ephemeral=True
+    )
 
 # Run the bot
 if __name__ == "__main__":
