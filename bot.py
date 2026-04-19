@@ -14,7 +14,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Store active sessions per guild
 active_sessions = {}
-checkin_sessions = {}  # Store active checkin sessions per guild
+checkin_sessions = {}  # Store active checkin sessions by message_id: {message_id: CheckinSession}
 
 class BookSession:
     def __init__(self, starter_id, expected_users=None):
@@ -23,6 +23,7 @@ class BookSession:
         self.recommendations = {}  # {user_id: [book1, book2]}
         self.user_names = {}  # {user_id: display_name}
         self.passed_users = set()
+        self.finished_users = set()  # Users who have completed their participation (2 books or passed)
         self.is_closed = False
     
     def add_recommendation(self, user_id, book_title, user_name):
@@ -30,12 +31,17 @@ class BookSession:
             self.recommendations[user_id] = []
         self.recommendations[user_id].append(book_title)
         self.user_names[user_id] = user_name
+        
+        # Mark as finished if they've hit 2 books
+        if len(self.recommendations[user_id]) >= 2:
+            self.finished_users.add(user_id)
     
     def user_book_count(self, user_id):
         return len(self.recommendations.get(user_id, []))
     
     def add_pass(self, user_id, user_name):
         self.passed_users.add(user_id)
+        self.finished_users.add(user_id)  # Passing means they're finished
         self.user_names[user_id] = user_name
     
     def has_passed(self, user_id):
@@ -50,9 +56,13 @@ class BookSession:
     def get_participant_count(self):
         return len(self.recommendations) + len(self.passed_users)
     
+    def get_finished_count(self):
+        """Count users who have finished participating (2 books or passed)"""
+        return len(self.finished_users)
+    
     def is_complete(self):
         if self.expected_users is not None:
-            return self.get_participant_count() >= self.expected_users
+            return self.get_finished_count() >= self.expected_users
         return False
 
 class CheckinSession:
@@ -214,7 +224,7 @@ class Checkin50Button(discord.ui.Button):
         super().__init__(label="📖 50% Progress", style=discord.ButtonStyle.primary, custom_id="checkin:50")
     
     async def callback(self, interaction: discord.Interaction):
-        session = checkin_sessions.get(interaction.guild_id)
+        session = checkin_sessions.get(interaction.message.id)
         
         if not session:
             await interaction.response.send_message(
@@ -246,7 +256,7 @@ class Checkin100Button(discord.ui.Button):
         super().__init__(label="✅ Finished (100%)", style=discord.ButtonStyle.success, custom_id="checkin:100")
     
     async def callback(self, interaction: discord.Interaction):
-        session = checkin_sessions.get(interaction.guild_id)
+        session = checkin_sessions.get(interaction.message.id)
         
         if not session:
             await interaction.response.send_message(
@@ -320,7 +330,8 @@ async def auto_close_session(interaction: discord.Interaction):
     if not session:
         return
     
-    await interaction.channel.send(f"🎉 Expected number of participants reached! Closing session and picking winner...")
+    # Use followup instead of channel.send to avoid permission issues
+    await interaction.followup.send(f"🎉 Expected number of participants reached! Closing session and picking winner...")
     await close_and_pick_winner(interaction, session, auto_close=True)
 
 async def close_and_pick_winner(interaction: discord.Interaction, session, auto_close=False):
@@ -330,7 +341,7 @@ async def close_and_pick_winner(interaction: discord.Interaction, session, auto_
     
     if not all_books:
         if auto_close:
-            await interaction.channel.send("❌ No books were recommended! Session closed with no winner.")
+            await interaction.followup.send("❌ No books were recommended! Session closed with no winner.")
         else:
             await interaction.response.send_message("❌ No books were recommended! Session closed with no winner.", ephemeral=False)
         del active_sessions[interaction.guild_id]
@@ -363,7 +374,7 @@ async def close_and_pick_winner(interaction: discord.Interaction, session, auto_
     
     # Send message based on how the function was called
     if auto_close:
-        await interaction.channel.send(embed=embed)
+        await interaction.followup.send(embed=embed)
     else:
         await interaction.response.send_message(embed=embed)
     
@@ -400,7 +411,7 @@ def create_session_embed(session, guild):
     if session.expected_users:
         embed.add_field(
             name="Progress",
-            value=f"{session.get_participant_count()}/{session.expected_users} participants",
+            value=f"{session.get_finished_count()}/{session.expected_users} participants finished",
             inline=False
         )
     
@@ -752,21 +763,12 @@ async def checkin(
     cover_url: str,
     expected_readers: int
 ):
-    if interaction.guild_id in checkin_sessions:
-        await interaction.response.send_message(
-            "❌ There's already an active checkin session in this server! "
-            "Only one checkin can be active at a time.",
-            ephemeral=True
-        )
-        return
-    
     if expected_readers < 1:
         await interaction.response.send_message("❌ Expected readers must be at least 1!", ephemeral=True)
         return
     
     # Create new checkin session
     session = CheckinSession(book_title, description, cover_url, expected_readers)
-    checkin_sessions[interaction.guild_id] = session
     
     # Create embed
     embed = create_checkin_embed(session)
@@ -774,6 +776,10 @@ async def checkin(
     # Send message with buttons
     view = CheckinView()
     await interaction.response.send_message(embed=embed, view=view)
+    
+    # Get the message that was just sent and store session by message_id
+    message = await interaction.original_response()
+    checkin_sessions[message.id] = session
     
     await interaction.followup.send(
         f"📢 {interaction.user.mention} started a reading progress checkin for **{book_title}**!",
