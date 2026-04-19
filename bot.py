@@ -228,10 +228,13 @@ class Checkin50Button(discord.ui.Button):
             return
         
         session.checkin_50(interaction.user.id, interaction.user.display_name)
-        await interaction.response.send_message(f"✅ {interaction.user.mention} is 50% through the book!", ephemeral=False)
+        
+        # Send ephemeral confirmation (no ping)
+        await interaction.response.send_message("✅ You've checked in at 50%!", ephemeral=True)
         
         # Update the embed
-        await update_checkin_message(interaction)
+        embed = create_checkin_embed(session)
+        await interaction.message.edit(embed=embed)
         
         # Check if we should ping for 50% milestone
         if session.should_ping_50():
@@ -257,10 +260,13 @@ class Checkin100Button(discord.ui.Button):
             return
         
         session.checkin_100(interaction.user.id, interaction.user.display_name)
-        await interaction.response.send_message(f"✅ {interaction.user.mention} has finished the book! 🎊", ephemeral=False)
+        
+        # Send ephemeral confirmation (no ping)
+        await interaction.response.send_message("✅ You've finished the book! 🎊", ephemeral=True)
         
         # Update the embed
-        await update_checkin_message(interaction)
+        embed = create_checkin_embed(session)
+        await interaction.message.edit(embed=embed)
         
         # Check if we should ping for 100% milestone
         if session.should_ping_100():
@@ -499,10 +505,15 @@ async def bookclub(interaction: discord.Interaction, expected_participants: int 
 
 # ===== BOOK PRICE LOOKUP FUNCTIONS =====
 
-async def get_book_info_from_google(book_title):
+async def get_book_info_from_google(book_title, author=None):
     """Get book info from Google Books API"""
     try:
-        url = f"https://www.googleapis.com/books/v1/volumes?q={quote_plus(book_title)}"
+        # Build search query with author if provided
+        search_query = book_title
+        if author:
+            search_query = f"{book_title} {author}"
+        
+        url = f"https://www.googleapis.com/books/v1/volumes?q={quote_plus(search_query)}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
@@ -530,12 +541,43 @@ async def get_book_info_from_google(book_title):
         print(f"Error fetching from Google Books: {e}")
     return None
 
-async def scrape_amazon_price(book_title):
+async def scrape_amazon_price(book_title, author=None):
     """Attempt to scrape Amazon price"""
     try:
-        search_url = f"https://www.amazon.com/s?k={quote_plus(book_title)}"
+        search_query = f"{book_title} {author}" if author else book_title
+        search_url = f"https://www.amazon.com/s?k={quote_plus(search_query)}&i=stripbooks"
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    # Look for price patterns - try multiple formats
+                    price_patterns = [
+                        r'<span class="a-price-whole">(\d+)</span><span class="a-price-fraction">(\d+)</span>',
+                        r'\$(\d+\.\d{2})',
+                        r'price_color[^>]*>[\$]?(\d+\.\d{2})'
+                    ]
+                    for pattern in price_patterns:
+                        match = re.search(pattern, html)
+                        if match:
+                            if len(match.groups()) == 2:  # whole and fraction
+                                return float(f"{match.group(1)}.{match.group(2)}")
+                            else:
+                                return float(match.group(1))
+    except Exception as e:
+        print(f"Error scraping Amazon: {e}")
+    return None
+
+async def scrape_bookshop_price(book_title, author=None):
+    """Attempt to scrape Bookshop.org price"""
+    try:
+        search_query = f"{book_title} {author}" if author else book_title
+        search_url = f"https://bookshop.org/search?keywords={quote_plus(search_query)}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         
         async with aiohttp.ClientSession() as session:
@@ -543,39 +585,28 @@ async def scrape_amazon_price(book_title):
                 if response.status == 200:
                     html = await response.text()
                     # Look for price patterns
-                    price_match = re.search(r'\$(\d+\.\d{2})', html)
-                    if price_match:
-                        return float(price_match.group(1))
-    except Exception as e:
-        print(f"Error scraping Amazon: {e}")
-    return None
-
-async def scrape_bookshop_price(book_title):
-    """Attempt to scrape Bookshop.org price"""
-    try:
-        search_url = f"https://bookshop.org/search?keywords={quote_plus(book_title)}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    price_match = re.search(r'\$(\d+\.\d{2})', html)
-                    if price_match:
-                        return float(price_match.group(1))
+                    price_patterns = [
+                        r'\$(\d+\.\d{2})',
+                        r'price[^>]*>[\$]?(\d+\.\d{2})'
+                    ]
+                    for pattern in price_patterns:
+                        match = re.search(pattern, html)
+                        if match:
+                            return float(match.group(1))
     except Exception as e:
         print(f"Error scraping Bookshop: {e}")
     return None
 
-async def get_retailer_links(book_title, isbn_13=None):
+async def get_retailer_links(book_title, author=None, isbn_13=None):
     """Generate retailer search links and attempt to get prices"""
     retailers = []
     
+    # Build search query with author if provided
+    search_query = f"{book_title} {author}" if author else book_title
+    
     # Amazon
-    amazon_url = f"https://www.amazon.com/s?k={quote_plus(book_title)}"
-    amazon_price = await scrape_amazon_price(book_title)
+    amazon_url = f"https://www.amazon.com/s?k={quote_plus(search_query)}&i=stripbooks"
+    amazon_price = await scrape_amazon_price(book_title, author)
     retailers.append({
         'name': 'Amazon',
         'url': amazon_url,
@@ -583,8 +614,8 @@ async def get_retailer_links(book_title, isbn_13=None):
     })
     
     # Bookshop.org (supports indie bookstores)
-    bookshop_url = f"https://bookshop.org/search?keywords={quote_plus(book_title)}"
-    bookshop_price = await scrape_bookshop_price(book_title)
+    bookshop_url = f"https://bookshop.org/search?keywords={quote_plus(search_query)}"
+    bookshop_price = await scrape_bookshop_price(book_title, author)
     retailers.append({
         'name': 'Bookshop.org',
         'url': bookshop_url,
@@ -592,7 +623,7 @@ async def get_retailer_links(book_title, isbn_13=None):
     })
     
     # Barnes & Noble
-    bn_url = f"https://www.barnesandnoble.com/s/{quote_plus(book_title)}"
+    bn_url = f"https://www.barnesandnoble.com/s/{quote_plus(search_query)}"
     retailers.append({
         'name': 'Barnes & Noble',
         'url': bn_url,
@@ -600,7 +631,7 @@ async def get_retailer_links(book_title, isbn_13=None):
     })
     
     # ThriftBooks (used books)
-    thrift_url = f"https://www.thriftbooks.com/browse/?b.search={quote_plus(book_title)}"
+    thrift_url = f"https://www.thriftbooks.com/browse/?b.search={quote_plus(search_query)}"
     retailers.append({
         'name': 'ThriftBooks',
         'url': thrift_url,
@@ -608,7 +639,7 @@ async def get_retailer_links(book_title, isbn_13=None):
     })
     
     # AbeBooks (used/rare books)
-    abe_url = f"https://www.abebooks.com/servlet/SearchResults?kn={quote_plus(book_title)}"
+    abe_url = f"https://www.abebooks.com/servlet/SearchResults?kn={quote_plus(search_query)}"
     retailers.append({
         'name': 'AbeBooks',
         'url': abe_url,
@@ -616,7 +647,7 @@ async def get_retailer_links(book_title, isbn_13=None):
     })
     
     # Book Depository (free worldwide shipping)
-    bookdep_url = f"https://www.bookdepository.com/search?searchTerm={quote_plus(book_title)}"
+    bookdep_url = f"https://www.bookdepository.com/search?searchTerm={quote_plus(search_query)}"
     retailers.append({
         'name': 'Book Depository',
         'url': bookdep_url,
@@ -683,16 +714,20 @@ def create_price_embed(book_info, retailers):
     return embed
 
 @bot.tree.command(name="bookprice", description="Find the best prices for a book across multiple retailers")
-@app_commands.describe(book_title="Title of the book to search for")
-async def bookprice(interaction: discord.Interaction, book_title: str):
+@app_commands.describe(
+    book_title="Title of the book to search for",
+    author="Author of the book (optional, helps find more accurate results)"
+)
+async def bookprice(interaction: discord.Interaction, book_title: str, author: str = None):
     await interaction.response.defer()  # This might take a moment
     
     # Get book info from Google Books
-    book_info = await get_book_info_from_google(book_title)
+    book_info = await get_book_info_from_google(book_title, author)
     
     # Get retailer links and attempt price scraping
     retailers = await get_retailer_links(
         book_title,
+        author,
         book_info['isbn_13'] if book_info else None
     )
     
