@@ -10,6 +10,9 @@ A Discord bot to help your book club select the next book to read. Members can r
 - Users can pass if they don't want to recommend a book
 - Optional: Set expected number of participants for auto-close once max number of participants have made a suggestion
 - Only the session starter can manually close the session
+- Reading progress checkin system to track who's reached 50% and 100% of the current book
+- Automatic @everyone pings when expected readers reach progress milestones
+- Book price lookup across multiple retailers with automatic price scraping when available
 
 ## Setup
 
@@ -101,6 +104,84 @@ Once a session is active, use the buttons:
 5. Dana recommends "Ender's Game" and "Dune"
 6. Session auto-closes (4 participants reached)
 7. Bot randomly selects one book as the winner
+
+## Reading Progress Checkin
+
+The `/checkin` command helps track reading progress for your current book club selection.
+
+### Starting a Checkin Session
+
+```
+/checkin book_title:"Remarkably Bright Creatures" description:"A heartwarming tale of friendship between a woman and an octopus" cover_url:"https://..." expected_readers:10
+```
+
+**Parameters:**
+- `book_title`: Title of the current book
+- `description`: Brief description or tagline
+- `cover_url`: URL to the book cover image
+- `expected_readers`: Number of readers you expect to participate
+
+### Checking In
+
+Once a checkin session is active, members can click buttons to log their progress:
+
+- **📖 50% Progress**: Click when you're halfway through the book
+- **✅ Finished (100%)**: Click when you've completed the book
+
+### Milestone Notifications
+
+- When the expected number of readers reach 50%, the bot pings @everyone
+- When the expected number of readers finish (100%), the bot pings @everyone again
+- The embed updates in real-time showing who has checked in at each milestone
+
+### Rules
+
+- You can only check in once at each milestone (50% and 100%)
+- Checking in at 100% automatically counts you as having reached 50%
+- Only one checkin session can be active per server at a time
+- The embed shows your book cover and tracks progress toward your expected reader count
+
+## Book Price Lookup
+
+The `/bookprice` command helps you find the best deals on books across multiple retailers.
+
+### Usage
+
+```
+/bookprice book_title:"Remarkably Bright Creatures"
+```
+
+**What it does:**
+- Searches Google Books API to get book information and ISBN
+- Provides direct search links to 6 major book retailers:
+  - Amazon
+  - Bookshop.org (supports independent bookstores)
+  - Barnes & Noble
+  - ThriftBooks (used books)
+  - AbeBooks (used/rare books)
+  - Book Depository (free worldwide shipping)
+- Attempts to scrape live prices from retailers when possible
+- Displays results sorted by price (lowest first)
+- Shows book cover and author information
+
+### How It Works
+
+The bot uses a **hybrid approach**:
+1. **Gets book metadata** from Google Books API (title, authors, ISBN, cover image)
+2. **Generates direct search links** to all major retailers
+3. **Attempts price scraping** for retailers that allow it (Amazon, Bookshop.org)
+4. **Sorts results** by price when available, with the cheapest options shown first
+
+### Example Output
+
+The embed will show:
+- Book title and author(s)
+- Book cover thumbnail
+- List of retailer links with prices (when available)
+- A tip showing the lowest price found
+- Note that prices are approximate and users should click through to confirm
+
+**Note:** Price scraping may not always work due to anti-bot measures, but the direct links will always be provided so members can quickly check all retailers.
 
 
 ## Troubleshooting
